@@ -1,4 +1,3 @@
-// server.js
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
@@ -7,19 +6,18 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
+
+// ✅ Middlewares
 app.use(cors());
 app.use(bodyParser.json());
 
-// ----- MongoDB -----
+// ✅ MongoDB Connection
 mongoose
-  .connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
+  .connect(process.env.MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch((err) => console.error("❌ MongoDB connection error:", err));
 
-// ----- Transaction schema -----
+// ✅ Schema & Model
 const transactionSchema = new mongoose.Schema({
   MerchantRequestID: String,
   CheckoutRequestID: String,
@@ -28,217 +26,208 @@ const transactionSchema = new mongoose.Schema({
   Amount: Number,
   MpesaReceiptNumber: String,
   TransactionDate: String,
-  PhoneNumber: String,
-  receiverNumber: String,
+  PhoneNumber: String, // Buyer (payer)
+  ReceivingNumber: String, // NEW: Recipient of bundles
   rawCallback: Object,
-  createdAt: { type: Date, default: Date.now },
 });
+
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
-// ----- Env variables -----
+// ✅ Env variables
 const {
   CONSUMER_KEY,
   CONSUMER_SECRET,
   SHORTCODE,
   PASSKEY,
   CALLBACK_URL,
-  MPESA_ENV = "sandbox",
-  PORT = 3000,
+  MPESA_ENV,
 } = process.env;
 
-// ----- Base URL -----
+// ✅ Base URL (Sandbox or Live)
 const baseURL =
   MPESA_ENV === "live"
     ? "https://api.safaricom.co.ke"
     : "https://sandbox.safaricom.co.ke";
 
-// ----- Helpers -----
-function formatTimestamp() {
-  // returns YYYYMMDDhhmmss (M-Pesa required)
-  const d = new Date();
-  const YYYY = d.getFullYear();
-  const MM = `${d.getMonth() + 1}`.padStart(2, "0");
-  const DD = `${d.getDate()}`.padStart(2, "0");
-  const hh = `${d.getHours()}`.padStart(2, "0");
-  const mm = `${d.getMinutes()}`.padStart(2, "0");
-  const ss = `${d.getSeconds()}`.padStart(2, "0");
-  return `${YYYY}${MM}${DD}${hh}${mm}${ss}`;
+// ✅ Sanitize XML
+function sanitizeXml(str = "") {
+  return str.replace(
+    /[&<>'"]/g,
+    (c) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "'": "&apos;",
+        '"': "&quot;",
+      }[c])
+  );
 }
 
-function makePassword(shortcode, passkey, timestamp) {
-  return Buffer.from(`${shortcode}${passkey}${timestamp}`).toString("base64");
-}
-
-function normalizePhone(input) {
-  if (!input) return "";
-  let s = input.toString().trim();
-  if (s.startsWith("07")) return "254" + s.substring(1);
-  if (s.startsWith("+254")) return s.replace("+", "");
-  if (s.startsWith("254")) return s;
-  // trying to salvage: if 9 digits (7XXXXXXXX) maybe add 254
-  if (/^\d{9}$/.test(s)) return "254" + s;
-  return s;
-}
-
-// ----- Token cache (simple) -----
-let tokenCache = { token: null, expiresAt: 0 };
-async function getAccessToken() {
-  const now = Date.now();
-  if (tokenCache.token && tokenCache.expiresAt > now + 5000) {
-    return tokenCache.token;
-  }
-
+// 🔹 Get Access Token
+app.get("/token", async (req, res) => {
   const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString(
     "base64"
   );
-  const url = `${baseURL}/oauth/v1/generate?grant_type=client_credentials`;
-  const { data } = await axios.get(url, {
-    headers: { Authorization: `Basic ${auth}` },
-  });
-  tokenCache.token = data.access_token;
-  // expires_in (seconds)
-  tokenCache.expiresAt = now + (data.expires_in || 3600) * 1000;
-  return tokenCache.token;
-}
-
-// ----- Routes -----
-
-// Root
-app.get("/", (req, res) =>
-  res.send("🚀 M-Pesa + MongoDB API deployed successfully!")
-);
-
-// TOKEN (optional)
-app.get("/token", async (req, res) => {
   try {
-    const token = await getAccessToken();
-    res.json({ access_token: token });
-  } catch (err) {
-    console.error("token err:", err.response?.data || err.message);
-    res
-      .status(500)
-      .json({
-        message: "Failed to get token",
-        error: err.response?.data || err.message,
-      });
+    const { data } = await axios.get(
+      `${baseURL}/oauth/v1/generate?grant_type=client_credentials`,
+      { headers: { Authorization: `Basic ${auth}` } }
+    );
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to get access token",
+      error: error.response?.data || error.message,
+    });
   }
 });
 
-// STK Push - expects { phone, amount, receiver } - receiver optional (defaults to paying phone)
+// 🔹 STK Push
 app.post("/stkpush", async (req, res) => {
+  const { buyingNumber, receivingNumber, amount } = req.body;
+
+  if (!buyingNumber || !amount) {
+    return res
+      .status(400)
+      .json({ message: "Buying number and amount are required" });
+  }
+
   try {
-    let { phone, amount, receiver } = req.body;
-    if (!phone || !amount)
-      return res.status(400).json({ message: "phone and amount are required" });
+    // 1️⃣ Get Access Token
+    const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString(
+      "base64"
+    );
+    const { data: tokenData } = await axios.get(
+      `${baseURL}/oauth/v1/generate?grant_type=client_credentials`,
+      { headers: { Authorization: `Basic ${auth}` } }
+    );
+    const accessToken = tokenData.access_token;
 
-    // normalize and validate
-    const partyA = normalizePhone(phone);
-    const receiverNormalized = receiver ? normalizePhone(receiver) : partyA;
+    // 2️⃣ Timestamp & Password
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[-T:.Z]/g, "")
+      .slice(0, 14);
+    const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString(
+      "base64"
+    );
 
-    if (!/^2547\d{8}$/.test(partyA)) {
-      return res
-        .status(400)
-        .json({
-          message:
-            "Invalid paying phone format. Use 07XXXXXXXX or +2547XXXXXXXX or 2547XXXXXXXX",
-        });
-    }
-
-    // get token
-    const accessToken = await getAccessToken();
-
-    // prepare values
-    const timestamp = formatTimestamp();
-    const password = makePassword(SHORTCODE, PASSKEY, timestamp);
-
+    // 3️⃣ Payload — uses the BUYING number to pay
     const payload = {
       BusinessShortCode: SHORTCODE,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: "CustomerPayBillOnline", // CustomerBuyGoodsOnline also OK; choose per your shortcode
+      TransactionType: "CustomerBuyGoodsOnline",
       Amount: amount,
-      PartyA: partyA, // paying number
-      PartyB: SHORTCODE, // typically your shortcode
-      PhoneNumber: partyA,
-      CallBackURL: CALLBACK_URL, // must be https and reachable
-      AccountReference: `RichTech-${receiverNormalized}`, // include receiver to reference
-      TransactionDesc: `Bundle purchase for ${receiverNormalized}`,
+      PartyA: sanitizeXml(buyingNumber.toString()),
+      PartyB: "8341270", // Your till or shortcode
+      PhoneNumber: sanitizeXml(buyingNumber.toString()),
+      CallBackURL: sanitizeXml(CALLBACK_URL),
+      AccountReference: "RichTech Bundles",
+      TransactionDesc: `Bundle purchase for ${receivingNumber || buyingNumber}`,
     };
 
-    // call Safaricom
-    const url = `${baseURL}/mpesa/stkpush/v1/processrequest`;
-    const { data: stkResponse } = await axios.post(url, payload, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      timeout: 15000,
+    // 4️⃣ Request to Safaricom
+    const { data: stkResponse } = await axios.post(
+      `${baseURL}/mpesa/stkpush/v1/processrequest`,
+      payload,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    // 📝 Save initial transaction info (optional but helpful)
+    await Transaction.create({
+      MerchantRequestID: stkResponse.MerchantRequestID,
+      CheckoutRequestID: stkResponse.CheckoutRequestID,
+      Amount: amount,
+      PhoneNumber: buyingNumber,
+      ReceivingNumber: receivingNumber || buyingNumber,
+      ResultDesc: "Awaiting payment",
     });
 
-    // respond with Safaricom response + save basic request record
-    res.json({ success: true, payload: stkResponse });
+    res.json({
+      success: true,
+      message: "STK Push sent. Confirm on your phone.",
+      payload: stkResponse,
+    });
   } catch (error) {
-    console.error("STK Push error:", error.response?.data || error.message);
-    res
-      .status(500)
-      .json({
-        message: "STK Push failed",
-        error: error.response?.data || error.message,
-      });
+    console.error("💥 STK Push error:", error.response?.data || error.message);
+    res.status(500).json({
+      message: "STK Push failed",
+      error: error.response?.data || error.message,
+    });
   }
 });
 
-// Callback route - Safaricom will POST here
+// 🔹 Callback from Safaricom
 app.post("/callbackurl", async (req, res) => {
+  console.log("✅ Callback Received:", JSON.stringify(req.body, null, 2));
   try {
-    // Safaricom posts a Body.stkCallback
-    const body = req.body || {};
-    console.log("Received callback:", JSON.stringify(body, null, 2));
+    const callback = req.body.Body.stkCallback;
 
-    // try to access stkCallback
-    const cb = body.Body?.stkCallback || body.Body?.STKCallback || null;
-    if (!cb) {
-      console.warn("No stkCallback found in body");
-      return res.status(400).json({ message: "No callback body found" });
-    }
-
-    const metaItems = cb.CallbackMetadata?.Item || [];
-    const getVal = (name) =>
-      metaItems.find((i) => i.Name === name)?.Value || null;
-
-    const newTransaction = new Transaction({
-      MerchantRequestID: cb.MerchantRequestID,
-      CheckoutRequestID: cb.CheckoutRequestID,
-      ResultCode: cb.ResultCode,
-      ResultDesc: cb.ResultDesc,
-      Amount: getVal("Amount") || 0,
-      MpesaReceiptNumber: getVal("MpesaReceiptNumber") || "",
-      TransactionDate: getVal("TransactionDate") || "",
-      PhoneNumber: getVal("PhoneNumber") || "",
-      rawCallback: body,
+    // Find the transaction first
+    const existingTx = await Transaction.findOne({
+      CheckoutRequestID: callback.CheckoutRequestID,
     });
 
-    await newTransaction.save();
-    console.log("💾 Saved transaction:", newTransaction._id);
+    // Prepare transaction data
+    const updateData = {
+      MerchantRequestID: sanitizeXml(callback.MerchantRequestID),
+      CheckoutRequestID: sanitizeXml(callback.CheckoutRequestID),
+      ResultCode: callback.ResultCode,
+      ResultDesc: sanitizeXml(callback.ResultDesc),
+      rawCallback: req.body,
+    };
 
-    // Safaricom expects a JSON response with ResultCode 0 for success
+    // Add payment metadata if available
+    if (callback.CallbackMetadata) {
+      const items = callback.CallbackMetadata.Item;
+      updateData.Amount =
+        items.find((i) => i.Name === "Amount")?.Value ||
+        existingTx?.Amount ||
+        0;
+      updateData.MpesaReceiptNumber =
+        items.find((i) => i.Name === "MpesaReceiptNumber")?.Value || "";
+      updateData.TransactionDate =
+        items.find((i) => i.Name === "TransactionDate")?.Value || "";
+      updateData.PhoneNumber =
+        items.find((i) => i.Name === "PhoneNumber")?.Value ||
+        existingTx?.PhoneNumber;
+    }
+
+    // Update or create
+    await Transaction.findOneAndUpdate(
+      { CheckoutRequestID: callback.CheckoutRequestID },
+      updateData,
+      { upsert: true }
+    );
+
+    console.log("💾 Transaction updated successfully");
+
     res.json({ ResultCode: 0, ResultDesc: "Success" });
   } catch (err) {
-    console.error("Error saving callback:", err);
+    console.error("❌ Error saving callback:", err);
     res.status(500).json({ message: "Callback save error" });
   }
 });
 
-// List transactions
+// 🔹 Fetch Transactions
 app.get("/transactions", async (req, res) => {
   try {
-    const transactions = await Transaction.find()
-      .sort({ createdAt: -1 })
-      .limit(100);
+    const transactions = await Transaction.find().sort({ _id: -1 });
     res.json(transactions);
   } catch (err) {
     res.status(500).json({ message: "Error fetching transactions" });
   }
 });
 
-// Start
+// 🔹 Root Route
+app.get("/", (req, res) => {
+  res.send("🚀 M-Pesa + MongoDB API deployed successfully!");
+});
+
+// ✅ Start Server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log(`🚀 Server running in ${MPESA_ENV} mode on port ${PORT}`)
 );
